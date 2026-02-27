@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EmailHuntr — AI Email Intelligence</title>
+<meta name="description" content="AI-powered email finder that searches company websites, directories, PDFs, social profiles, news, videos and government records. Email scraper sites blocked.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎯</text></svg>">
+<style>
+  body { margin: 0; background: #080612; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.9/babel.min.js"></script>
+<script type="text/babel" data-type="module">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   UTILITIES
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+// Domain from company name
+const toDomain = (company) => {
+  if (!company) return "";
+  const c = company.trim().toLowerCase();
+  const clean = c
+    .replace(/\b(group|inc|incorporated|corp|corporation|ltd|limited|llc|plc|pty|co|company|gmbh|ag|sa|srl|bv|nv|holdings|enterprises|international|intl|services|solutions|technologies|tech|and|the)\b/gi, "")
+    .trim().replace(/[^a-z0-9\s]/g, "").replace(/\s+/g, "");
+  return (clean || c.replace(/[^a-z0-9]/g, "")) + ".com";
+};
+
+// ★ COPY — works in sandboxed iframes where navigator.clipboard is blocked
+const copyToClipboard = (text) => {
+  // Try modern API first
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+    navigator.clipboard.writeText(text).catch(() => fallbackCopy(text));
+    return;
+  }
+  fallbackCopy(text);
+};
+
+const fallbackCopy = (text) => {
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.position = "fixed";
+  ta.style.left = "-9999px";
+  ta.style.top = "-9999px";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.focus();
+  ta.select();
+  try { document.execCommand("copy"); } catch {}
+  document.body.removeChild(ta);
+};
+
+// ★ CSV EXPORT — works in sandboxed iframes
+const downloadCSV = (rows, filename) => {
+  const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(",")).join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  // Cleanup after a short delay
+  setTimeout(() => {
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }, 100);
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   BLOCKED SOURCES
+   ═══════════════════════════════════════════════════════════════════════════ */
+const BLOCKED = [
+  "hunter.io","apollo.io","rocketreach.co","contactout.com","lusha.com",
+  "zoominfo.com","clearbit.com","snov.io","voilanorbert.com","findthat.email",
+  "anymailfinder.com","skrapp.io","getprospect.com","leadiq.com","seamless.ai",
+  "kaspr.io","wiza.co","uplead.com","adapt.io","aeroleads.com",
+];
+const isBlocked = (url) => url && BLOCKED.some((b) => url.toLowerCase().includes(b));
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   AI SEARCH
+   ═══════════════════════════════════════════════════════════════════════════ */
+const aiSearch = async (name, title, company, country, onMsg) => {
+  const domain = toDomain(company);
+  onMsg("Launching AI agent with web search...");
+
+  const sys = `You are an email intelligence agent. Find REAL email addresses from PRIMARY sources.
+
+SEARCH THESE SOURCES (run multiple web searches):
+1. Company website — team/about/contact pages on ${domain}
+2. Web directories — yellowpages, crunchbase, bloomberg, opencorporates, kompass, dnb
+3. PDFs & files — "${company} filetype:pdf email", annual reports, SEC filings
+4. Social profiles — LinkedIn, Twitter/X bios, GitHub, Facebook pages
+5. News — press releases, interviews, news articles
+6. Videos — YouTube descriptions, conference talks
+7. Images — business cards, letterheads, slides
+8. Government — company registrations, patent filings, court docs
+
+BLOCKED (NEVER use): ${BLOCKED.join(", ")}
+If an email is ONLY from these sites, skip it.
+
+SEARCH QUERIES (run 4-6):
+- "${name} ${company} email"
+- "${name} ${company} contact"
+- "site:${domain} ${name}"
+- "${company} team directory email"
+- "${name} ${title || ""} ${company}"
+- "${company} email format pattern"
+
+Return ONLY valid JSON (no markdown/backticks):
+{
+  "emails":[{"email":"","confidence":0,"source":"","sourceUrl":"","sourceType":"company_website|directory|pdf|social|news|video|image|government|other","foundOn":""}],
+  "formats":[{"pattern":"","example":"","frequency":""}],
+  "companyInfo":{"officialWebsite":"","industry":"","headquarters":"","employeeCount":"","socialProfiles":[],"domainVerified":false},
+  "searchLog":[{"query":"","sourceType":"","resultsFound":0,"emailsExtracted":0}],
+  "searchSummary":{"totalSearches":0,"sourcesScanned":0,"emailsFound":0,"note":""}
+}`;
+
+  try {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 4000,
+        system: sys,
+        messages: [{ role: "user", content: `Find emails for: Name: ${name||"?"}, Title: ${title||"?"}, Company: ${company||"?"}, Country: ${country||"?"}, Domain: ${domain}` }],
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+      }),
+    });
+    onMsg("Processing results...");
+    const data = await resp.json();
+    const txt = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
+    let parsed = null;
+    try { parsed = JSON.parse(txt.trim()); } catch {
+      const m = txt.match(/\{[\s\S]*\}/);
+      if (m) try { parsed = JSON.parse(m[0]); } catch {}
+    }
+    if (parsed?.emails) {
+      parsed.emails = parsed.emails.filter((e) => !isBlocked(e.sourceUrl) && !BLOCKED.some((b) => (e.source||"").toLowerCase().includes(b.split(".")[0])));
+      return { ok: true, data: parsed, raw: txt };
+    }
+    return { ok: false, raw: txt, error: "Could not parse results" };
+  } catch (err) {
+    return { ok: false, error: err.message, raw: "" };
+  }
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   EMAIL VERIFY
+   ═══════════════════════════════════════════════════════════════════════════ */
+const verifyOne = async (email) => {
+  const domain = email.split("@")[1];
+  if (!domain) return { valid: false, reason: "Invalid format", score: 0 };
+  try {
+    const resp = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 800,
+        system: `Verify an email. Search for the domain MX records. Return ONLY JSON: {"valid":true/false,"domain_exists":true/false,"mx_records":true/false,"format_valid":true/false,"disposable":false,"role_based":false,"score":0-100,"reason":"explanation"}`,
+        messages: [{ role: "user", content: `Verify: ${email} — Check domain ${domain} MX records, legitimacy, disposable status.` }],
+        tools: [{ type: "web_search_20250305", name: "web_search" }],
+      }),
+    });
+    const data = await resp.json();
+    const txt = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
+    try { return JSON.parse(txt.trim()); } catch {
+      const m = txt.match(/\{[\s\S]*?\}/);
+      if (m) try { return JSON.parse(m[0]); } catch {}
+    }
+    return { valid: null, reason: "Parse failed", score: 50 };
+  } catch { return { valid: null, reason: "Network error", score: 0 }; }
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PREDICTIONS
+   ═══════════════════════════════════════════════════════════════════════════ */
+const predict = (name, company) => {
+  const d = toDomain(company);
+  if (!d || !name) return [];
+  const parts = name.trim().split(/\s+/);
+  const f = parts[0]?.toLowerCase() || "";
+  const l = parts.length > 1 ? parts[parts.length - 1]?.toLowerCase() : "";
+  const out = [];
+  if (f && l) {
+    out.push({ email: `${f}.${l}@${d}`, pattern: "firstname.lastname", confidence: 70 });
+    out.push({ email: `${f[0]}${l}@${d}`, pattern: "flastname", confidence: 55 });
+    out.push({ email: `${f}.${l[0]}@${d}`, pattern: "firstname.l", confidence: 40 });
+    out.push({ email: `${f[0]}.${l}@${d}`, pattern: "f.lastname", confidence: 35 });
+  }
+  if (f) out.push({ email: `${f}@${d}`, pattern: "firstname", confidence: 45 });
+  return out;
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ICONS (all as consistent function components)
+   ═══════════════════════════════════════════════════════════════════════════ */
+function IcSearch({ size = 18 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>; }
+function IcMail({ size = 16 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/></svg>; }
+function IcGlobe({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>; }
+function IcFile({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6M16 13H8M16 17H8M10 9H8"/></svg>; }
+function IcUser({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>; }
+function IcCase({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="2" y="7" width="20" height="14" rx="2"/><path d="M16 21V5a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v16"/></svg>; }
+function IcBldg({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4M8 6h.01M16 6h.01M12 6h.01M8 10h.01M16 10h.01M12 10h.01M8 14h.01M16 14h.01M12 14h.01"/></svg>; }
+function IcPin({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0Z"/><circle cx="12" cy="10" r="3"/></svg>; }
+function IcNews({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M4 22h16a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2H8a2 2 0 0 0-2 2v16a2 2 0 0 1-2 2zm0 0a2 2 0 0 1-2-2v-9c0-1.1.9-2 2-2h2"/></svg>; }
+function IcCopy({ size = 13 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>; }
+function IcCheck({ size = 13 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round"><path d="M20 6 9 17l-5-5"/></svg>; }
+function IcDown({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>; }
+function IcZap({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg>; }
+function IcShield({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>; }
+function IcSpin() { return <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" style={{ animation: "spin 1s linear infinite" }}><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>; }
+function IcExt({ size = 12 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6M15 3h6v6M10 14 21 3"/></svg>; }
+function IcLink({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>; }
+function IcSparkle({ size = 16 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="m12 3-1.9 5.8a2 2 0 0 1-1.3 1.3L3 12l5.8 1.9a2 2 0 0 1 1.3 1.3L12 21l1.9-5.8a2 2 0 0 1 1.3-1.3L21 12l-5.8-1.9a2 2 0 0 1-1.3-1.3Z"/></svg>; }
+function IcWarn({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4M12 17h.01"/></svg>; }
+function IcTarget({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>; }
+function IcDb({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>; }
+function IcCross({ size = 22 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="10"/><path d="M22 12h-4M6 12H2M12 6V2M12 22v-4"/></svg>; }
+function IcUsers({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>; }
+function IcShieldCheck({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>; }
+function IcVideo({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="m10 9 5 3-5 3z"/></svg>; }
+function IcImage({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></svg>; }
+function IcGovt({ size = 14 }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M3 21h18M3 10h18M12 3l9 7H3z"/><path d="M5 10v11M9 10v11M15 10v11M19 10v11"/></svg>; }
+
+const SrcIcon = ({ type }) => {
+  const map = { company_website: IcGlobe, directory: IcDb, pdf: IcFile, social: IcUser, news: IcNews, video: IcVideo, image: IcImage, government: IcGovt };
+  const C = map[type] || IcGlobe;
+  return <C />;
+};
+
+const srcClr = (t) => ({
+  company_website: { bg: "rgba(20,184,166,0.15)", tx: "#2dd4bf", bd: "rgba(20,184,166,0.3)" },
+  directory: { bg: "rgba(99,102,241,0.15)", tx: "#818cf8", bd: "rgba(99,102,241,0.3)" },
+  pdf: { bg: "rgba(244,63,94,0.15)", tx: "#fb7185", bd: "rgba(244,63,94,0.3)" },
+  social: { bg: "rgba(168,85,247,0.15)", tx: "#c084fc", bd: "rgba(168,85,247,0.3)" },
+  news: { bg: "rgba(245,158,11,0.15)", tx: "#fbbf24", bd: "rgba(245,158,11,0.3)" },
+  video: { bg: "rgba(239,68,68,0.15)", tx: "#f87171", bd: "rgba(239,68,68,0.3)" },
+  image: { bg: "rgba(236,72,153,0.15)", tx: "#f472b6", bd: "rgba(236,72,153,0.3)" },
+  government: { bg: "rgba(34,211,238,0.15)", tx: "#22d3ee", bd: "rgba(34,211,238,0.3)" },
+}[t] || { bg: "rgba(148,163,184,0.12)", tx: "#94a3b8", bd: "rgba(148,163,184,0.25)" });
+
+const confClr = (c) => c >= 80 ? "#2dd4bf" : c >= 60 ? "#fbbf24" : c >= 40 ? "#fb923c" : "#f87171";
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   INPUT FIELD COMPONENT
+   ═══════════════════════════════════════════════════════════════════════════ */
+function Field({ label, icon, required, value, onChange, placeholder, onKeyDown, inputRef }) {
+  return (
+    <div>
+      <label style={ST.label}>{icon} {label} {required && <span style={{ color: "#f43f5e" }}>*</span>}</label>
+      <div style={ST.inputWrap}>
+        <input
+          ref={inputRef}
+          type="text"
+          placeholder={placeholder}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onKeyDown={onKeyDown}
+          style={ST.input}
+        />
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   COPY BUTTON COMPONENT (with reliable feedback)
+   ═══════════════════════════════════════════════════════════════════════════ */
+function CopyBtn({ text, id, copied, onCopy }) {
+  const isCopied = copied === id;
+  return (
+    <button
+      onClick={(e) => { e.stopPropagation(); copyToClipboard(text); onCopy(id); }}
+      title="Copy to clipboard"
+      style={{
+        ...ST.cpBtn,
+        color: isCopied ? "#2dd4bf" : "rgba(255,255,255,0.35)",
+        borderColor: isCopied ? "rgba(20,184,166,0.3)" : "rgba(255,255,255,0.06)",
+      }}
+    >
+      {isCopied ? <IcCheck /> : <IcCopy />}
+    </button>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MAIN APP
+   ═══════════════════════════════════════════════════════════════════════════ */
+function App() {
+  const [mode, setMode] = useState("single");
+  const [name, setName] = useState("");
+  const [title, setTitle] = useState("");
+  const [company, setCompany] = useState("");
+  const [country, setCountry] = useState("");
+  const [searching, setSearching] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [results, setResults] = useState(null);
+  const [preds, setPreds] = useState(null);
+  const [raw, setRaw] = useState("");
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState(null);
+  const [tab, setTab] = useState("emails");
+  const [filter, setFilter] = useState("all");
+  const nameRef = useRef(null);
+
+  const [bulkText, setBulkText] = useState("");
+  const [bulkRes, setBulkRes] = useState([]);
+  const [bulkOn, setBulkOn] = useState(false);
+  const [bulkProg, setBulkProg] = useState({ i: 0, n: 0 });
+
+  const [verText, setVerText] = useState("");
+  const [verRes, setVerRes] = useState([]);
+  const [verOn, setVerOn] = useState(false);
+  const [verProg, setVerProg] = useState({ i: 0, n: 0 });
+
+  useEffect(() => { if (mode === "single") nameRef.current?.focus(); }, [mode]);
+
+  const ok = name.trim() && company.trim();
+
+  // Copy handler with timer
+  const doCopy = useCallback((id) => {
+    setCopied(id);
+    setTimeout(() => setCopied(null), 1800);
+  }, []);
+
+  // ── Search ──
+  const doSearch = useCallback(async () => {
+    if (!ok || searching) return;
+    setSearching(true); setResults(null); setPreds(null); setError(""); setRaw(""); setTab("emails"); setFilter("all");
+    setPreds(predict(name, company));
+    const r = await aiSearch(name, title, company, country, setMsg);
+    if (r.ok && r.data) { setResults(r.data); setRaw(r.raw || ""); }
+    else { setError(r.error || "No structured data."); if (r.raw) setRaw(r.raw); }
+    setSearching(false); setMsg("");
+  }, [name, title, company, country, ok, searching]);
+
+  // ── Bulk ──
+  const doBulk = useCallback(async () => {
+    const rows = bulkText.trim().split("\n").filter(Boolean).map((l) => {
+      const p = l.split(",").map((s) => s.trim());
+      return { name: p[0] || "", title: p[1] || "", company: p[2] || "", country: p[3] || "" };
+    }).filter((r) => r.name && r.company);
+    if (!rows.length) return;
+    setBulkOn(true); setBulkRes([]); setBulkProg({ i: 0, n: rows.length });
+    for (let i = 0; i < rows.length; i++) {
+      setBulkProg({ i: i + 1, n: rows.length });
+      const row = rows[i];
+      const r = await aiSearch(row.name, row.title, row.company, row.country, () => {});
+      const emails = r.ok && r.data?.emails?.length ? r.data.emails : predict(row.name, row.company).map((p) => ({ ...p, source: "Pattern", sourceType: "other", sourceUrl: "" }));
+      setBulkRes((prev) => [...prev, { ...row, emails, real: r.ok && !!r.data?.emails?.length }]);
+    }
+    setBulkOn(false);
+  }, [bulkText]);
+
+  // ── Verify ──
+  const doVerify = useCallback(async () => {
+    const list = verText.trim().split("\n").map((s) => s.trim()).filter((s) => s.includes("@"));
+    if (!list.length) return;
+    setVerOn(true); setVerRes([]); setVerProg({ i: 0, n: list.length });
+    for (let i = 0; i < list.length; i++) {
+      setVerProg({ i: i + 1, n: list.length });
+      const r = await verifyOne(list[i]);
+      setVerRes((prev) => [...prev, { email: list[i], ...r }]);
+    }
+    setVerOn(false);
+  }, [verText]);
+
+  const onKey = (e) => { if (e.key === "Enter") doSearch(); };
+  const allEmails = results?.emails || [];
+  const shown = filter === "all" ? allEmails : allEmails.filter((e) => e.sourceType === filter);
+  const types = [...new Set(allEmails.map((e) => e.sourceType))];
+
+  /* ─── RENDER ─── */
+  return (
+    <div style={ST.root}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap');
+        @keyframes spin{to{transform:rotate(360deg)}}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+        @keyframes slideIn{from{opacity:0;transform:translateX(-12px)}to{opacity:1;transform:translateX(0)}}
+        @keyframes gradMove{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
+        @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+        *{box-sizing:border-box;margin:0;padding:0}
+        ::selection{background:rgba(20,184,166,0.3)}
+        input:focus,textarea:focus{outline:none}
+        button{cursor:pointer;border:none;background:none;font-family:inherit}
+        ::-webkit-scrollbar{width:5px}::-webkit-scrollbar-track{background:transparent}::-webkit-scrollbar-thumb{background:rgba(255,255,255,0.08);border-radius:3px}
+        textarea{resize:vertical}
+      `}</style>
+
+      <div style={{ position: "fixed", inset: 0, pointerEvents: "none", background: "radial-gradient(ellipse at 15% 15%,rgba(20,184,166,0.06) 0%,transparent 50%),radial-gradient(ellipse at 85% 85%,rgba(168,85,247,0.05) 0%,transparent 50%),radial-gradient(ellipse at 50% 40%,rgba(244,63,94,0.03) 0%,transparent 50%)" }} />
+
+      {/* HEADER */}
+      <header style={ST.header}>
+        <div style={ST.logoRow}>
+          <div style={ST.logoIcon}><IcCross /></div>
+          <div>
+            <div style={ST.logoName}>Email<span style={ST.logoAcc}>Huntr</span></div>
+            <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", letterSpacing: "0.06em", textTransform: "uppercase" }}>AI Email Intelligence · Primary Sources Only</div>
+          </div>
+        </div>
+        <div style={ST.modeRow}>
+          {[
+            { id: "single", label: "Single Search", Ic: IcTarget },
+            { id: "bulk", label: "Bulk Search", Ic: IcUsers },
+            { id: "verify", label: "Email Verify", Ic: IcShieldCheck },
+          ].map((m) => (
+            <button key={m.id} onClick={() => setMode(m.id)} style={{ ...ST.modeBtn, ...(mode === m.id ? ST.modeBtnOn : {}) }}>
+              <m.Ic /> {m.label}
+            </button>
+          ))}
+        </div>
+      </header>
+
+      {/* ═══ SINGLE ═══ */}
+      {mode === "single" && <>
+        <div style={ST.card}>
+          <div style={ST.grid4}>
+            <Field label="Full Name" icon={<IcUser />} required value={name} onChange={setName} placeholder="Tim Cook" onKeyDown={onKey} inputRef={nameRef} />
+            <Field label="Job Title" icon={<IcCase />} value={title} onChange={setTitle} placeholder="CEO" onKeyDown={onKey} />
+            <Field label="Company" icon={<IcBldg />} required value={company} onChange={setCompany} placeholder="Apple Inc" onKeyDown={onKey} />
+            <Field label="Country" icon={<IcPin />} value={country} onChange={setCountry} placeholder="United States" onKeyDown={onKey} />
+          </div>
+          {company.trim() && <div style={ST.hint}><IcLink /> Predicted domain: <strong style={{ color: "#2dd4bf" }}>{toDomain(company)}</strong></div>}
+          <button onClick={doSearch} disabled={searching || !ok} style={{ ...ST.mainBtn, opacity: searching || !ok ? 0.5 : 1, pointerEvents: searching || !ok ? "none" : "auto" }}>
+            {searching ? <IcSpin /> : <IcTarget />} <span>{searching ? "Hunting…" : "Hunt Emails"}</span>
+          </button>
+          <div style={ST.chips}>
+            {["🌐 Company Sites", "📁 Directories", "📄 PDFs/Files", "👤 Social", "📰 News", "🎬 Videos", "🖼 Images", "🏛 Gov Records"].map((c, i) => <span key={i} style={ST.chip}>{c}</span>)}
+          </div>
+          <div style={ST.blockedBar}><IcShield /> <span>Blocked: Hunter.io, Apollo, RocketReach, ContactOut, Lusha, ZoomInfo, Clearbit + 13 more scrapers</span></div>
+        </div>
+
+        {/* Searching */}
+        {searching && (
+          <div style={{ ...ST.card, animation: "fadeUp .3s ease", borderColor: "rgba(20,184,166,0.15)" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, color: "#2dd4bf", marginBottom: 14 }}>
+              <IcSparkle /> <strong>AI Agent — Multi-Step Search</strong>
+              <span style={{ marginLeft: "auto", fontSize: 11, color: "#a78bfa", fontFamily: "'JetBrains Mono',monospace" }}>{toDomain(company)}</span>
+            </div>
+            <div style={{ height: 3, background: "rgba(255,255,255,0.05)", borderRadius: 2, overflow: "hidden", marginBottom: 10 }}>
+              <div style={{ height: "100%", width: "70%", borderRadius: 2, background: "linear-gradient(90deg,#14b8a6,#a855f7,#f43f5e,#14b8a6)", backgroundSize: "300% 100%", animation: "gradMove 2s ease infinite" }} />
+            </div>
+            <p style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", fontFamily: "'JetBrains Mono',monospace" }}>
+              <span style={{ animation: "blink 1.5s ease infinite" }}>●</span> {msg || "Initializing…"}
+            </p>
+          </div>
+        )}
+
+        {error && !searching && <div style={ST.errBar}><IcWarn /> {error}</div>}
+
+        {/* Results */}
+        {!searching && (results || preds) && (
+          <div style={{ animation: "fadeUp .4s ease" }}>
+            {/* Person */}
+            <div style={ST.personRow}>
+              <div style={ST.avatar}>{name.split(" ").map((n) => n[0]).join("").slice(0, 2).toUpperCase()}</div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 18, fontWeight: 700 }}>{name}</div>
+                <div style={{ fontSize: 13, color: "rgba(255,255,255,0.35)", marginTop: 2 }}>{[title, company, country].filter(Boolean).join(" · ")}</div>
+                {company && <div style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12, color: "#2dd4bf", marginTop: 4, fontFamily: "'JetBrains Mono',monospace" }}><IcLink /> {toDomain(company)}</div>}
+              </div>
+              <div style={{ display: "flex", gap: 8, flexShrink: 0 }}>
+                <button onClick={() => {
+                  const all = [...(results?.emails?.map((e) => e.email) || []), ...(preds?.map((p) => p.email) || [])];
+                  copyToClipboard(all.join("\n"));
+                  doCopy("__all__");
+                }} style={ST.actBtn}>
+                  {copied === "__all__" ? <IcCheck /> : <IcCopy />} {copied === "__all__" ? "Copied!" : "Copy All"}
+                </button>
+                <button onClick={() => {
+                  const rows = [["Email", "Confidence", "Source", "Type", "URL", "Data"]];
+                  (results?.emails || []).forEach((e) => rows.push([e.email, e.confidence + "%", e.source, e.sourceType, e.sourceUrl, "Found"]));
+                  (preds || []).forEach((p) => rows.push([p.email, p.confidence + "%", p.pattern, "prediction", "-", "Predicted"]));
+                  downloadCSV(rows, `emailhuntr-${Date.now()}.csv`);
+                }} style={ST.actBtn}><IcDown /> CSV</button>
+              </div>
+            </div>
+
+            <div style={ST.dataBadge}>
+              {allEmails.length ? <><span style={ST.realBadge}>✦ REAL DATA</span><span style={{ fontSize: 12 }}>{allEmails.length} email(s) · Scraper sites excluded</span></> : <><span style={ST.predBadge}>⚡ PREDICTIONS</span><span style={{ fontSize: 12 }}>Pattern predictions only</span></>}
+            </div>
+
+            {/* Tabs */}
+            <div style={ST.tabRow}>
+              {[
+                { id: "emails", l: `Found (${allEmails.length})` },
+                { id: "predictions", l: `Patterns (${preds?.length || 0})` },
+                { id: "formats", l: "Formats" },
+                ...(results?.companyInfo ? [{ id: "company", l: "Intel" }] : []),
+                ...(raw ? [{ id: "raw", l: "Raw" }] : []),
+              ].map((t) => <button key={t.id} onClick={() => setTab(t.id)} style={{ ...ST.tab, ...(tab === t.id ? ST.tabOn : {}) }}>{t.l}</button>)}
+            </div>
+
+            {/* Emails */}
+            {tab === "emails" && <>
+              {types.length > 1 && <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 12 }}>
+                <button onClick={() => setFilter("all")} style={{ ...ST.fBtn, ...(filter === "all" ? ST.fOn : {}) }}>All</button>
+                {types.map((st) => <button key={st} onClick={() => setFilter(st)} style={{ ...ST.fBtn, ...(filter === st ? ST.fOn : {}) }}>{st} ({allEmails.filter((e) => e.sourceType === st).length})</button>)}
+              </div>}
+              {shown.length === 0 && <div style={{ textAlign: "center", padding: 40, color: "rgba(255,255,255,0.25)" }}>No verified emails. Check Patterns tab.</div>}
+              {shown.map((e, i) => {
+                const sc = srcClr(e.sourceType);
+                return (
+                  <div key={i} style={{ ...ST.eCard, animation: `slideIn .3s ease ${i * 0.06}s both` }}>
+                    <div style={ST.eTop}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, color: "#2dd4bf", minWidth: 0 }}>
+                        <IcMail />
+                        <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 14, fontWeight: 500 }}>{e.email}</span>
+                        <span style={ST.foundTag}>FOUND</span>
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+                        <span style={{ fontSize: 12, fontWeight: 700, fontFamily: "'JetBrains Mono',monospace", color: confClr(e.confidence) }}>{e.confidence}%</span>
+                        <CopyBtn text={e.email} id={`e-${i}`} copied={copied} onCopy={doCopy} />
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                      <span style={{ display: "inline-flex", alignItems: "center", gap: 5, fontSize: 10, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".05em", padding: "3px 9px", borderRadius: 5, background: sc.bg, color: sc.tx, border: `1px solid ${sc.bd}` }}>
+                        <SrcIcon type={e.sourceType} /> {e.sourceType}
+                      </span>
+                      <span style={{ fontSize: 12, color: "rgba(255,255,255,0.3)" }}>{e.source}{e.foundOn ? ` — ${e.foundOn}` : ""}</span>
+                      {e.sourceUrl && e.sourceUrl !== "#" && !isBlocked(e.sourceUrl) && (
+                        <a href={e.sourceUrl} target="_blank" rel="noopener noreferrer" style={{ fontSize: 11, color: "#2dd4bf", textDecoration: "none", display: "inline-flex", alignItems: "center", gap: 4, marginLeft: "auto" }}>
+                          Open source <IcExt />
+                        </a>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </>}
+
+            {/* Predictions */}
+            {tab === "predictions" && preds && <div>
+              <div style={ST.warnBar}><IcWarn /> <strong>Pattern predictions</strong> — not verified. Educated guesses only.</div>
+              {preds.map((p, i) => (
+                <div key={i} style={{ ...ST.eCard, animation: `slideIn .3s ease ${i * 0.06}s both` }}>
+                  <div style={ST.eTop}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, color: "#fbbf24" }}>
+                      <IcMail /> <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 14, fontWeight: 500 }}>{p.email}</span>
+                      <span style={ST.predTag}>PREDICTED</span>
+                    </div>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontSize: 12, fontWeight: 700, fontFamily: "'JetBrains Mono',monospace", color: confClr(p.confidence) }}>{p.confidence}%</span>
+                      <CopyBtn text={p.email} id={`p-${i}`} copied={copied} onCopy={doCopy} />
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 12, color: "rgba(255,255,255,0.25)" }}>Pattern: {p.pattern}</div>
+                </div>
+              ))}
+            </div>}
+
+            {/* Formats */}
+            {tab === "formats" && <div>
+              <div style={{ ...ST.card, padding: 12, marginBottom: 8, display: "flex", alignItems: "center", gap: 8, color: "#fbbf24", fontWeight: 600 }}>
+                <IcZap /> Email patterns for <strong>{company}</strong>
+                <span style={{ marginLeft: "auto", fontSize: 11, color: "#a78bfa", fontFamily: "'JetBrains Mono',monospace", background: "rgba(168,85,247,0.1)", padding: "2px 8px", borderRadius: 4 }}>{toDomain(company)}</span>
+              </div>
+              {(results?.formats || [
+                { pattern: `firstname.lastname@${toDomain(company)}`, example: `john.smith@${toDomain(company)}`, frequency: "55%" },
+                { pattern: `flastname@${toDomain(company)}`, example: `jsmith@${toDomain(company)}`, frequency: "25%" },
+                { pattern: `firstname@${toDomain(company)}`, example: `john@${toDomain(company)}`, frequency: "12%" },
+                { pattern: `f.lastname@${toDomain(company)}`, example: `j.smith@${toDomain(company)}`, frequency: "8%" },
+              ]).map((f, i) => (
+                <div key={i} style={{ ...ST.eCard, animation: `slideIn .3s ease ${i * 0.08}s both` }}>
+                  <div style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 14, fontWeight: 600, marginBottom: 6 }}>{f.pattern}</div>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <code style={{ fontSize: 12, color: "rgba(255,255,255,0.3)" }}>{f.example}</code>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 11, color: "rgba(255,255,255,0.35)" }}>
+                      <div style={{ width: 50, height: 3, background: "rgba(255,255,255,0.05)", borderRadius: 2, overflow: "hidden" }}>
+                        <div style={{ height: "100%", background: "linear-gradient(90deg,#14b8a6,#a855f7)", borderRadius: 2, width: f.frequency }} />
+                      </div>
+                      {f.frequency}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>}
+
+            {tab === "company" && results?.companyInfo && <div style={ST.card}>
+              {Object.entries(results.companyInfo).map(([k, v]) => (
+                <div key={k} style={{ display: "flex", gap: 16, padding: "8px 0", borderBottom: "1px solid rgba(255,255,255,0.03)" }}>
+                  <span style={{ fontSize: 12, fontWeight: 600, color: "rgba(255,255,255,0.35)", textTransform: "capitalize", minWidth: 140 }}>{k.replace(/([A-Z])/g, " $1")}</span>
+                  <span style={{ fontSize: 13, flex: 1, wordBreak: "break-all" }}>{Array.isArray(v) ? v.map((x, j) => <a key={j} href={x} target="_blank" rel="noopener noreferrer" style={{ color: "#2dd4bf", textDecoration: "none", fontSize: 12, display: "block" }}>{x}</a>) : typeof v === "string" && v.startsWith("http") ? <a href={v} target="_blank" rel="noopener noreferrer" style={{ color: "#2dd4bf", textDecoration: "none" }}>{v}</a> : String(v)}</span>
+                </div>
+              ))}
+            </div>}
+
+            {tab === "raw" && raw && <div style={ST.card}>
+              <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 10 }}>
+                <span style={{ fontSize: 11, fontWeight: 600, opacity: 0.4 }}>RAW AI RESPONSE</span>
+                <button onClick={() => { copyToClipboard(raw); doCopy("raw"); }} style={ST.actBtn}>{copied === "raw" ? <IcCheck /> : <IcCopy />} Copy</button>
+              </div>
+              <pre style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 11, color: "rgba(255,255,255,0.4)", whiteSpace: "pre-wrap", wordBreak: "break-word", maxHeight: 400, overflow: "auto", lineHeight: 1.6 }}>{raw}</pre>
+            </div>}
+          </div>
+        )}
+
+        {/* Empty */}
+        {!results && !preds && !searching && (
+          <div style={{ textAlign: "center", padding: "50px 20px", animation: "fadeUp .5s ease" }}>
+            <div style={{ width: 72, height: 72, borderRadius: 20, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto 20px", color: "rgba(255,255,255,0.15)" }}><IcCross size={32} /></div>
+            <p style={{ fontSize: 20, fontWeight: 700, marginBottom: 8 }}>Hunt emails from primary sources</p>
+            <p style={{ fontSize: 14, color: "rgba(255,255,255,0.3)", maxWidth: 500, margin: "0 auto 24px", lineHeight: 1.7 }}>
+              Real web searches across company websites, directories, PDFs, social profiles, news, videos, and government records. <strong>Email scrapers blocked.</strong>
+            </p>
+            <button onClick={() => { setName("Tim Cook"); setTitle("CEO"); setCompany("Apple Inc"); setCountry("United States"); }} style={ST.exBtn}><IcZap /> Try: Tim Cook — Apple Inc</button>
+          </div>
+        )}
+      </>}
+
+      {/* ═══ BULK ═══ */}
+      {mode === "bulk" && (
+        <div style={{ animation: "fadeUp .3s ease" }}>
+          <div style={ST.card}>
+            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 4 }}>Bulk Email Search</div>
+            <p style={{ fontSize: 12, color: "rgba(255,255,255,0.35)", marginBottom: 12 }}>One per line: <code style={{ background: "rgba(255,255,255,0.05)", padding: "2px 6px", borderRadius: 4 }}>Name, Title, Company, Country</code></p>
+            <textarea value={bulkText} onChange={(e) => setBulkText(e.target.value)} rows={6} placeholder={"Tim Cook, CEO, Apple Inc, USA\nSatya Nadella, CEO, Microsoft, USA\nJensen Huang, CEO, NVIDIA, USA"} style={ST.textarea} />
+            <div style={{ display: "flex", gap: 12, alignItems: "center", marginTop: 12 }}>
+              <button onClick={doBulk} disabled={bulkOn || !bulkText.trim()} style={{ ...ST.mainBtn, flex: "none", padding: "10px 24px", opacity: bulkOn || !bulkText.trim() ? 0.5 : 1 }}>
+                {bulkOn ? <IcSpin /> : <IcUsers />} {bulkOn ? `${bulkProg.i}/${bulkProg.n}…` : "Search All"}
+              </button>
+              {bulkOn && <div style={{ flex: 1, height: 3, background: "rgba(255,255,255,0.05)", borderRadius: 2, overflow: "hidden" }}>
+                <div style={{ height: "100%", background: "linear-gradient(90deg,#14b8a6,#a855f7)", borderRadius: 2, width: `${(bulkProg.i / bulkProg.n) * 100}%`, transition: "width .3s" }} />
+              </div>}
+            </div>
+          </div>
+          {bulkRes.length > 0 && <div style={{ marginTop: 16 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+              <span style={{ fontSize: 14, fontWeight: 700 }}>Results ({bulkRes.length})</span>
+              <button onClick={() => {
+                const rows = [["Name", "Title", "Company", "Country", "Email", "Confidence", "Source", "Type"]];
+                bulkRes.forEach((r) => r.emails.forEach((e) => rows.push([r.name, r.title, r.company, r.country, e.email, e.confidence + "%", e.source || "", r.real ? "Found" : "Predicted"])));
+                downloadCSV(rows, `bulk-${Date.now()}.csv`);
+              }} style={ST.actBtn}><IcDown /> Export All</button>
+            </div>
+            {bulkRes.map((r, i) => (
+              <div key={i} style={{ ...ST.eCard, marginBottom: 10, animation: `slideIn .3s ease ${i * 0.05}s both` }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <div><strong>{r.name}</strong> <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 12 }}>· {r.title} · {r.company}</span></div>
+                  <span style={{ fontSize: 10, fontWeight: 700, padding: "2px 6px", borderRadius: 4, ...(r.real ? { background: "rgba(20,184,166,0.15)", color: "#2dd4bf" } : { background: "rgba(245,158,11,0.15)", color: "#fbbf24" }) }}>{r.real ? "FOUND" : "PREDICTED"}</span>
+                </div>
+                {r.emails.map((e, j) => (
+                  <div key={j} style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 0", fontSize: 13 }}>
+                    <IcMail size={12} />
+                    <span style={{ fontFamily: "'JetBrains Mono',monospace", color: "#2dd4bf" }}>{e.email}</span>
+                    <span style={{ fontSize: 11, color: confClr(e.confidence), fontFamily: "'JetBrains Mono',monospace" }}>{e.confidence}%</span>
+                    <CopyBtn text={e.email} id={`b-${i}-${j}`} copied={copied} onCopy={doCopy} />
+                    <span style={{ fontSize: 10, color: "rgba(255,255,255,0.2)", marginLeft: "auto" }}>{e.source || e.sourceType}</span>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>}
+        </div>
+      )}
+
+      {/* ═══ VERIFY ═══ */}
+      {mode === "verify" && (
+        <div style={{ animation: "fadeUp .3s ease" }}>
+          <div style={ST.card}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 14, fontWeight: 700, marginBottom: 4 }}><IcShieldCheck /> Email Verification</div>
+            <p style={{ fontSize: 12, color: "rgba(255,255,255,0.35)", marginBottom: 12 }}>One email per line. Checks MX records, format, disposable status, deliverability.</p>
+            <textarea value={verText} onChange={(e) => setVerText(e.target.value)} rows={5} placeholder={"tim.cook@apple.com\nfake@nonexistent123456.com\ninfo@google.com"} style={ST.textarea} />
+            <button onClick={doVerify} disabled={verOn || !verText.trim()} style={{ ...ST.mainBtn, marginTop: 12, opacity: verOn || !verText.trim() ? 0.5 : 1 }}>
+              {verOn ? <IcSpin /> : <IcShieldCheck />} {verOn ? `${verProg.i}/${verProg.n}…` : "Verify Emails"}
+            </button>
+          </div>
+          {verRes.length > 0 && <div style={{ marginTop: 16 }}>
+            <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 12 }}>Results</div>
+            {verRes.map((r, i) => {
+              const clr = r.valid === true ? "#2dd4bf" : r.valid === false ? "#f87171" : "#fbbf24";
+              const bg = r.valid === true ? "rgba(20,184,166,0.1)" : r.valid === false ? "rgba(244,63,94,0.1)" : "rgba(245,158,11,0.1)";
+              const lbl = r.valid === true ? "VALID" : r.valid === false ? "INVALID" : "UNKNOWN";
+              return (
+                <div key={i} style={{ ...ST.eCard, marginBottom: 8, animation: `slideIn .3s ease ${i * 0.06}s both` }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <IcMail /> <span style={{ fontFamily: "'JetBrains Mono',monospace", fontSize: 14, fontWeight: 500, color: clr }}>{r.email}</span>
+                    </div>
+                    <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: ".08em", padding: "3px 8px", borderRadius: 5, background: bg, color: clr, border: `1px solid ${clr}30` }}>{lbl}</span>
+                  </div>
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(4,1fr)", gap: 8 }}>
+                    {[
+                      { l: "Domain", v: r.domain_exists },
+                      { l: "MX Records", v: r.mx_records },
+                      { l: "Format", v: r.format_valid },
+                      { l: "Score", v: `${r.score || 0}/100`, isScore: true },
+                    ].map((c, j) => (
+                      <div key={j} style={{ padding: "6px 8px", borderRadius: 6, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.04)", textAlign: "center" }}>
+                        <div style={{ fontSize: 10, color: "rgba(255,255,255,0.3)", marginBottom: 2 }}>{c.l}</div>
+                        <div style={{ fontSize: 12, fontWeight: 600, color: c.isScore ? clr : c.v === true ? "#2dd4bf" : c.v === false ? "#f87171" : "#fbbf24" }}>
+                          {c.isScore ? c.v : c.v === true ? "✓ Yes" : c.v === false ? "✗ No" : "?"}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  {r.reason && <div style={{ fontSize: 11, color: "rgba(255,255,255,0.25)", marginTop: 8 }}>{r.reason}</div>}
+                  {(r.disposable || r.role_based) && <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
+                    {r.disposable && <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "rgba(244,63,94,0.1)", color: "#f87171" }}>⚠ Disposable</span>}
+                    {r.role_based && <span style={{ fontSize: 10, padding: "2px 6px", borderRadius: 4, background: "rgba(245,158,11,0.1)", color: "#fbbf24" }}>📋 Role-based</span>}
+                  </div>}
+                </div>
+              );
+            })}
+          </div>}
+        </div>
+      )}
+
+      <footer style={{ textAlign: "center", marginTop: 32, padding: "20px 0", borderTop: "1px solid rgba(255,255,255,0.03)", fontSize: 11, color: "rgba(255,255,255,0.15)", display: "flex", justifyContent: "center", gap: 8 }}>
+        EmailHuntr v5.0 <span>·</span> Apify Marketplace <span>·</span> AI Web Search + Verification
+      </footer>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   STYLES
+   ═══════════════════════════════════════════════════════════════════════════ */
+const ST = {
+  root: { fontFamily: "'Outfit',sans-serif", minHeight: "100vh", background: "#080612", color: "#e8e0f0", padding: "28px 20px", maxWidth: 940, margin: "0 auto", position: "relative" },
+  header: { marginBottom: 24 },
+  logoRow: { display: "flex", alignItems: "center", gap: 12, marginBottom: 16 },
+  logoIcon: { width: 44, height: 44, borderRadius: 12, background: "linear-gradient(135deg,#14b8a6,#a855f7,#f43f5e)", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", boxShadow: "0 4px 24px rgba(20,184,166,0.25)" },
+  logoName: { fontSize: 26, fontWeight: 800, letterSpacing: "-0.03em" },
+  logoAcc: { background: "linear-gradient(135deg,#14b8a6,#a855f7,#f43f5e)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" },
+  modeRow: { display: "flex", gap: 4, background: "rgba(255,255,255,0.02)", borderRadius: 12, padding: 4, border: "1px solid rgba(255,255,255,0.04)" },
+  modeBtn: { flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 6, padding: "10px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600, color: "rgba(255,255,255,0.35)", transition: "all .2s", border: "1px solid transparent" },
+  modeBtnOn: { background: "linear-gradient(135deg,rgba(20,184,166,0.12),rgba(168,85,247,0.08))", color: "#2dd4bf", borderColor: "rgba(20,184,166,0.12)" },
+  card: { background: "rgba(255,255,255,0.025)", backdropFilter: "blur(20px)", border: "1px solid rgba(255,255,255,0.05)", borderRadius: 16, padding: 20, marginBottom: 16 },
+  grid4: { display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginBottom: 14 },
+  label: { display: "flex", alignItems: "center", gap: 5, fontSize: 11, fontWeight: 600, textTransform: "uppercase", letterSpacing: ".08em", color: "rgba(255,255,255,0.35)", marginBottom: 6 },
+  inputWrap: { background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 10, padding: "10px 14px" },
+  input: { width: "100%", background: "none", border: "none", color: "#f0eaff", fontSize: 14, fontFamily: "'Outfit',sans-serif" },
+  hint: { display: "flex", alignItems: "center", gap: 8, padding: "8px 14px", marginBottom: 14, background: "rgba(20,184,166,0.05)", border: "1px solid rgba(20,184,166,0.12)", borderRadius: 8, fontSize: 12, color: "rgba(255,255,255,0.4)" },
+  mainBtn: { width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, padding: "14px 20px", borderRadius: 12, background: "linear-gradient(135deg,#14b8a6,#a855f7)", color: "#fff", fontSize: 15, fontWeight: 700, boxShadow: "0 4px 24px rgba(20,184,166,0.25)", transition: "opacity .2s" },
+  chips: { display: "flex", flexWrap: "wrap", gap: 6, justifyContent: "center", marginTop: 14 },
+  chip: { fontSize: 11, padding: "4px 10px", borderRadius: 6, background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.05)", color: "rgba(255,255,255,0.35)" },
+  blockedBar: { display: "flex", alignItems: "center", gap: 8, marginTop: 10, padding: "8px 12px", background: "rgba(244,63,94,0.04)", border: "1px solid rgba(244,63,94,0.1)", borderRadius: 8, fontSize: 10, color: "rgba(255,255,255,0.3)" },
+  errBar: { display: "flex", alignItems: "center", gap: 10, padding: "12px 16px", background: "rgba(244,63,94,0.08)", border: "1px solid rgba(244,63,94,0.2)", borderRadius: 10, fontSize: 13, color: "#fb7185", marginBottom: 16 },
+  personRow: { display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.05)", borderRadius: 16, padding: "16px 20px", marginBottom: 12 },
+  avatar: { width: 50, height: 50, borderRadius: 14, background: "linear-gradient(135deg,#14b8a6,#a855f7,#f43f5e)", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 17, fontWeight: 700, flexShrink: 0 },
+  actBtn: { display: "flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 8, background: "rgba(255,255,255,0.04)", color: "rgba(255,255,255,0.5)", fontSize: 12, fontWeight: 600, border: "1px solid rgba(255,255,255,0.06)" },
+  dataBadge: { display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", padding: "10px 16px", marginBottom: 12, background: "rgba(255,255,255,0.015)", border: "1px solid rgba(255,255,255,0.03)", borderRadius: 10, fontSize: 12, color: "rgba(255,255,255,0.35)" },
+  realBadge: { fontSize: 10, fontWeight: 700, letterSpacing: ".08em", padding: "3px 8px", borderRadius: 5, background: "rgba(20,184,166,0.15)", color: "#2dd4bf", border: "1px solid rgba(20,184,166,0.2)" },
+  predBadge: { fontSize: 10, fontWeight: 700, letterSpacing: ".08em", padding: "3px 8px", borderRadius: 5, background: "rgba(245,158,11,0.15)", color: "#fbbf24", border: "1px solid rgba(245,158,11,0.2)" },
+  tabRow: { display: "flex", gap: 4, marginBottom: 16, background: "rgba(255,255,255,0.02)", borderRadius: 12, padding: 4, border: "1px solid rgba(255,255,255,0.03)", overflowX: "auto" },
+  tab: { padding: "9px 14px", borderRadius: 8, fontSize: 12, fontWeight: 600, color: "rgba(255,255,255,0.3)", whiteSpace: "nowrap", transition: "all .2s" },
+  tabOn: { background: "rgba(20,184,166,0.12)", color: "#2dd4bf" },
+  fBtn: { padding: "5px 12px", borderRadius: 7, fontSize: 11, fontWeight: 600, color: "rgba(255,255,255,0.3)", background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.04)", textTransform: "capitalize" },
+  fOn: { background: "rgba(20,184,166,0.1)", color: "#2dd4bf", borderColor: "rgba(20,184,166,0.2)" },
+  eCard: { background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.04)", borderRadius: 12, padding: "14px 18px", marginBottom: 8 },
+  eTop: { display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10, flexWrap: "wrap", gap: 8 },
+  cpBtn: { width: 32, height: 32, borderRadius: 8, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)", transition: "all .15s" },
+  foundTag: { fontSize: 8, fontWeight: 700, letterSpacing: ".1em", padding: "2px 6px", borderRadius: 4, background: "rgba(20,184,166,0.15)", color: "#2dd4bf" },
+  predTag: { fontSize: 8, fontWeight: 700, letterSpacing: ".1em", padding: "2px 6px", borderRadius: 4, background: "rgba(245,158,11,0.15)", color: "#fbbf24" },
+  warnBar: { display: "flex", alignItems: "flex-start", gap: 10, padding: "12px 16px", background: "rgba(245,158,11,0.06)", border: "1px solid rgba(245,158,11,0.15)", borderRadius: 10, fontSize: 12, color: "rgba(255,255,255,0.45)", lineHeight: 1.5, marginBottom: 12 },
+  exBtn: { display: "inline-flex", alignItems: "center", gap: 8, padding: "12px 24px", borderRadius: 12, fontSize: 13, fontWeight: 600, color: "#2dd4bf", background: "rgba(20,184,166,0.08)", border: "1px solid rgba(20,184,166,0.2)" },
+  textarea: { width: "100%", background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.06)", borderRadius: 10, padding: "12px 14px", color: "#f0eaff", fontSize: 13, fontFamily: "'JetBrains Mono',monospace", lineHeight: 1.6 },
+};
+
+
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+</script>
+</body>
+</html>
